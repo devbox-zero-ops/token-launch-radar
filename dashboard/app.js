@@ -57,8 +57,9 @@
       `<div class="kpi"><div class="kpi-label">$1k Farmer Verdicts</div><div class="kpi-val pos">${vc.FARM} FARM</div><div class="kpi-sub">${vc.SELECTIVE} SELECTIVE · ${vc.SKIP} SKIP (costed gas + 4% opp)</div></div>`,
     ].join('');
 
+    const catTerm = val.kept_features.includes('category_residual') ? '+γ_cat' : '';
     document.getElementById('int-summary').textContent =
-      `log(MCap)=${val.intercept.toFixed(2)}+${val.tvl_elasticity.toFixed(2)}·log(TVL)+γ_cat | Kept: ${val.kept_features.join(', ')} | Dropped: ${val.dropped_features.join(', ')}`;
+      `log(MCap)=${val.intercept.toFixed(2)}+${val.tvl_elasticity.toFixed(2)}·log(TVL)${catTerm} | Kept: ${val.kept_features.join(', ')} | Dropped: ${val.dropped_features.join(', ') || 'None'}`;
 
     document.getElementById('cnt-all').textContent = String(data.rows.length);
     document.getElementById('cnt-wl').textContent = String(data.watchlist_covered);

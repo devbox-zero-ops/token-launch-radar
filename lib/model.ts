@@ -182,8 +182,8 @@ function isEligiblePreToken(p: SnapshotProtocol, watchlistSet: Set<string>): boo
   return p.tvl_usd >= 5_000_000;
 }
 
-/** Deterministic IRLS Huber linear solver with L2 ridge on non-intercept weights. */
-function fitHuber(X: number[][], y: number[], lam = 1.5, delta = 1.0, iters = 25): number[] {
+/** Deterministic IRLS Huber linear solver with per-column L2 ridge penalties. */
+function fitHuber(X: number[][], y: number[], lams: number[], delta = 1.0, iters = 25): number[] {
   const n = X.length;
   const m = X[0]!.length;
   const wSample = new Array<number>(n).fill(1.0);
@@ -204,7 +204,7 @@ function fitHuber(X: number[][], y: number[], lam = 1.5, delta = 1.0, iters = 25
         }
       }
     }
-    for (let i = 1; i < m; i += 1) A[i]![i] = A[i]![i]! + lam;
+    for (let i = 0; i < m; i += 1) A[i]![i] = A[i]![i]! + (lams[i] ?? 0.0);
 
     const M = A.map((row, idx) => [...row, b[idx]!]);
     for (let i = 0; i < m; i += 1) {
@@ -238,15 +238,21 @@ function fitHuber(X: number[][], y: number[], lam = 1.5, delta = 1.0, iters = 25
 
 type CandFeature = 'category_residual' | 'log_chains' | 'log_age' | 'change_7d';
 
-function buildCatResiduals(train: SnapshotProtocol[]): Map<string, number> {
+function meanLogTvlOf(rows: SnapshotProtocol[]): number {
+  let s = 0;
+  for (const p of rows) s += Math.log(p.tvl_usd);
+  return rows.length > 0 ? s / rows.length : 18.0;
+}
+
+function buildCatResiduals(train: SnapshotProtocol[], meanLogTvl: number): Map<string, number> {
   const b0 = fitHuber(
-    train.map((p) => [1.0, Math.log(p.tvl_usd)]),
+    train.map((p) => [1.0, Math.log(p.tvl_usd) - meanLogTvl]),
     train.map((p) => Math.log(p.mcap_usd!)),
-    0.1,
+    [0.0, 0.01],
   );
   const buckets = new Map<string, number[]>();
   for (const p of train) {
-    const r = Math.log(p.mcap_usd!) - (b0[0]! + b0[1]! * Math.log(p.tvl_usd));
+    const r = Math.log(p.mcap_usd!) - (b0[0]! + b0[1]! * (Math.log(p.tvl_usd) - meanLogTvl));
     const cat = p.category ?? 'Other';
     const arr = buckets.get(cat) ?? [];
     arr.push(r);
@@ -264,11 +270,12 @@ function buildCatResiduals(train: SnapshotProtocol[]): Map<string, number> {
 function buildFeatureVec(
   p: SnapshotProtocol,
   asOf: string,
+  meanLogTvl: number,
   features: CandFeature[],
   catRes: Map<string, number>,
   medAgeDays: number,
 ): number[] {
-  const v = [1.0, Math.log(p.tvl_usd)];
+  const v = [1.0, Math.log(p.tvl_usd) - meanLogTvl];
   for (const f of features) {
     if (f === 'category_residual') {
       v.push(catRes.get(p.category ?? 'Other') ?? 0.0);
@@ -290,25 +297,26 @@ function evalConfig(
   features: CandFeature[],
 ): { loocvMed: number; loocvP75: number; wfMed: number; wfTrainN: number; wfTestN: number; signedLogs: number[] } {
   const needsCat = features.includes('category_residual');
+  const lams = [0.0, 0.01, ...features.map(() => 0.5)];
   const signedLogs: number[] = [];
   const foldErrs: number[] = [];
 
   for (let i = 0; i < cohort.length; i += 1) {
     const test = cohort[i]!;
     const train = cohort.filter((_, j) => j !== i);
+    const meanLt = meanLogTvlOf(train);
     const ages = train
       .map((p) => daysBetween(p.listed_at, asOf))
       .filter((x): x is number => x !== null)
       .sort((a, b) => a - b);
     const medAge = ages.length > 0 ? quantile(ages, 0.5) : 365;
-    const catRes = needsCat ? buildCatResiduals(train) : new Map<string, number>();
-    const lam = features.length === 0 ? 0.5 : 1.5;
+    const catRes = needsCat ? buildCatResiduals(train, meanLt) : new Map<string, number>();
     const beta = fitHuber(
-      train.map((p) => buildFeatureVec(p, asOf, features, catRes, medAge)),
+      train.map((p) => buildFeatureVec(p, asOf, meanLt, features, catRes, medAge)),
       train.map((p) => Math.log(p.mcap_usd!)),
-      lam,
+      lams,
     );
-    const xTest = buildFeatureVec(test, asOf, features, catRes, medAge);
+    const xTest = buildFeatureVec(test, asOf, meanLt, features, catRes, medAge);
     let pred = 0.0;
     for (let k = 0; k < beta.length; k += 1) pred += beta[k]! * xTest[k]!;
     const signed = Math.log(test.mcap_usd!) - pred;
@@ -328,21 +336,21 @@ function evalConfig(
   const wfTrain = dated.slice(0, cut);
   const wfTest = dated.slice(cut);
 
+  const wfMeanLt = meanLogTvlOf(wfTrain);
   const wfAges = wfTrain
     .map((p) => daysBetween(p.listed_at, asOf))
     .filter((x): x is number => x !== null)
     .sort((a, b) => a - b);
   const wfMedAge = wfAges.length > 0 ? quantile(wfAges, 0.5) : 365;
-  const wfCatRes = needsCat ? buildCatResiduals(wfTrain) : new Map<string, number>();
-  const wfLam = features.length === 0 ? 0.5 : 1.5;
+  const wfCatRes = needsCat ? buildCatResiduals(wfTrain, wfMeanLt) : new Map<string, number>();
   const wfBeta = fitHuber(
-    wfTrain.map((p) => buildFeatureVec(p, asOf, features, wfCatRes, wfMedAge)),
+    wfTrain.map((p) => buildFeatureVec(p, asOf, wfMeanLt, features, wfCatRes, wfMedAge)),
     wfTrain.map((p) => Math.log(p.mcap_usd!)),
-    wfLam,
+    lams,
   );
   const wfErrs = wfTest
     .map((p) => {
-      const xv = buildFeatureVec(p, asOf, features, wfCatRes, wfMedAge);
+      const xv = buildFeatureVec(p, asOf, wfMeanLt, features, wfCatRes, wfMedAge);
       let pred = 0.0;
       for (let k = 0; k < wfBeta.length; k += 1) pred += wfBeta[k]! * xv[k]!;
       return Math.exp(Math.abs(Math.log(p.mcap_usd!) - pred));
@@ -544,19 +552,20 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const p25Mult = Number(Math.exp(quantile(sortedSigned, 0.25)).toFixed(4));
   const p75Mult = Number(Math.exp(quantile(sortedSigned, 0.75)).toFixed(4));
 
-  const catResMap = keptFeatures.includes('category_residual') ? buildCatResiduals(cohort) : new Map<string, number>();
+  const meanLt = meanLogTvlOf(cohort);
+  const catResMap = keptFeatures.includes('category_residual') ? buildCatResiduals(cohort, meanLt) : new Map<string, number>();
   const cohortAges = cohort
     .map((p) => daysBetween(p.listed_at, snapshot.as_of))
     .filter((x): x is number => x !== null)
     .sort((a, b) => a - b);
   const medCohortAge = cohortAges.length > 0 ? quantile(cohortAges, 0.5) : 365;
   const finalBeta = fitHuber(
-    cohort.map((p) => buildFeatureVec(p, snapshot.as_of, keptFeatures, catResMap, medCohortAge)),
+    cohort.map((p) => buildFeatureVec(p, snapshot.as_of, meanLt, keptFeatures, catResMap, medCohortAge)),
     cohort.map((p) => Math.log(p.mcap_usd!)),
-    keptFeatures.length === 0 ? 0.5 : 1.5,
+    [0.0, 0.01, ...keptFeatures.map(() => 0.5)],
   );
-  const intercept = Number(finalBeta[0]!.toFixed(4));
   const tvlElasticity = Number(finalBeta[1]!.toFixed(4));
+  const intercept = Number((finalBeta[0]! - finalBeta[1]! * meanLt).toFixed(4));
   const catWeight = keptFeatures.includes('category_residual') ? finalBeta[2]! : 0;
 
   // Category stats for display
@@ -605,11 +614,11 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   const scored: Omit<BoardRow, 'rank'>[] = selected.map((p) => {
     const cat = p.category ?? 'Other';
-    const xVec = buildFeatureVec(p, snapshot.as_of, keptFeatures, catResMap, medCohortAge);
+    const xVec = buildFeatureVec(p, snapshot.as_of, meanLt, keptFeatures, catResMap, medCohortAge);
     let predLog = 0.0;
     for (let k = 0; k < finalBeta.length; k += 1) predLog += finalBeta[k]! * xVec[k]!;
 
-    const tvlBaseUsd = Math.round(Math.exp(finalBeta[0]! + finalBeta[1]! * Math.log(p.tvl_usd)));
+    const tvlBaseUsd = Math.round(Math.exp(finalBeta[0]! + finalBeta[1]! * (Math.log(p.tvl_usd) - meanLt)));
     const catResidualLog = Number(((catResMap.get(cat) ?? 0) * catWeight).toFixed(4));
     const catMultiplier = Number(Math.exp(catResidualLog).toFixed(4));
 
