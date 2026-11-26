@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Token Launch Radar — Pre-Token Implied Valuation &amp; Farm Playbooks</title>
+  <title>Token Launch Radar v2 — Fitted Peer Valuations &amp; $/hr Farm Verdicts</title>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -13,7 +13,7 @@
       <div class="brand-mark" aria-hidden="true">TLR</div>
       <div>
         <h1>Token Launch Radar</h1>
-        <p class="subtitle">Empirical peer-multiple implied valuations &amp; costed farm playbooks for pre-token DeFi protocols</p>
+        <p class="subtitle">IRLS Huber peer-fitted valuations, honest P25–P75 ranges &amp; costed $1,000 farmer verdicts</p>
       </div>
     </div>
     <div class="meta-pills" id="meta-pills"></div>
@@ -22,17 +22,17 @@
   <main class="shell">
     <section class="kpi-grid" aria-label="Radar summary metrics" id="kpi-grid"></section>
 
-    <section class="calibration-bar" aria-label="Tokenized peer calibration multiples">
-      <div class="cal-head">
-        <h2>Peer Calibration Multiples (Tokenized Cohort)</h2>
-        <span class="cal-note" id="cal-note"></span>
+    <section class="integrity-bar" aria-label="Model validation and integrity summary">
+      <div class="int-left">
+        <span class="int-badge">VALIDATION &amp; INTEGRITY</span>
+        <span class="int-text" id="int-summary"></span>
       </div>
-      <div class="cal-chips" id="cal-chips"></div>
+      <button type="button" class="btn-val" id="btn-open-val">Inspect Validation &amp; Ablation</button>
     </section>
 
     <section class="controls" aria-label="Filter and sort radar">
       <div class="seg-group" role="group" aria-label="Protocol tier filter">
-        <button type="button" class="seg is-active" data-tier="all">All Pre-Token (<span id="cnt-all">0</span>)</button>
+        <button type="button" class="seg is-active" data-tier="all">All (<span id="cnt-all">0</span>)</button>
         <button type="button" class="seg" data-tier="watchlist">Watchlist &ge;$50M (<span id="cnt-wl">0</span>)</button>
         <button type="button" class="seg" data-tier="emerging">Emerging &lt;$50M (<span id="cnt-em">0</span>)</button>
       </div>
@@ -40,6 +40,15 @@
         <label class="field">
           <span>Search</span>
           <input id="f-search" type="search" placeholder="Protocol, category, or chain...">
+        </label>
+        <label class="field">
+          <span>Verdict</span>
+          <select id="f-verdict">
+            <option value="">All Verdicts</option>
+            <option value="FARM">FARM (&ge;$20 &amp; &ge;$10/hr)</option>
+            <option value="SELECTIVE">SELECTIVE (Net EV &gt; $0)</option>
+            <option value="SKIP">SKIP (Negative EV)</option>
+          </select>
         </label>
         <label class="field">
           <span>Category</span>
@@ -57,18 +66,19 @@
     <section class="table-card" aria-label="Ranked pre-token protocol board">
       <div class="table-wrap" role="region" aria-labelledby="radar-caption" tabindex="0">
         <table id="radar-table">
-          <caption id="radar-caption" class="sr-only">Pre-token DeFi protocols ranked by implied valuation</caption>
+          <caption id="radar-caption" class="sr-only">Pre-token DeFi protocols ranked by fitted implied valuation</caption>
           <thead>
             <tr>
               <th scope="col" aria-sort="ascending"><button type="button" data-sort="rank">#</button></th>
               <th scope="col"><button type="button" data-sort="name">Protocol</button></th>
               <th scope="col"><button type="button" data-sort="category">Category</button></th>
-              <th scope="col"><button type="button" data-sort="implied_value_usd">Implied Value</button></th>
+              <th scope="col"><button type="button" data-sort="implied_value_usd">Implied Value (P25–P75)</button></th>
               <th scope="col"><button type="button" data-sort="tvl_usd">TVL</button></th>
-              <th scope="col"><button type="button" data-sort="effective_multiple">Mult</button></th>
+              <th scope="col"><button type="button" data-sort="token_odds_pct">Token Odds</button></th>
+              <th scope="col"><button type="button" data-sort="usd_per_hour">Est. $/hr</button></th>
+              <th scope="col"><button type="button" data-sort="verdict">Verdict</button></th>
               <th scope="col"><button type="button" data-sort="change_7d">7d TVL</button></th>
-              <th scope="col"><button type="button" data-sort="age_days">Age</button></th>
-              <th scope="col">Est. Gas &amp; Playbook</th>
+              <th scope="col">Playbook</th>
             </tr>
           </thead>
           <tbody id="radar-tbody"></tbody>
@@ -89,13 +99,52 @@
     <div class="dlg-body">
       <div class="dlg-metrics" id="dlg-metrics"></div>
       <div class="dlg-section">
-        <h3>Implied Valuation Formula Breakdown</h3>
+        <h3>Fitted Valuation Breakdown (Peer-Calibrated)</h3>
         <div class="formula-grid" id="dlg-formula"></div>
+        <p class="dlg-note" id="dlg-val-note"></p>
       </div>
       <div class="dlg-section">
-        <h3>Concrete Farm Plan (Costed &amp; Time-Boxed)</h3>
+        <h3>$1,000 Reference Farmer Economics</h3>
+        <div class="formula-grid" id="dlg-econ"></div>
+      </div>
+      <div class="dlg-section">
+        <h3>Concrete Costed Farm Playbook</h3>
         <p class="dlg-horizon" id="dlg-horizon"></p>
         <ol class="farm-list" id="dlg-steps"></ol>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="val-dialog" class="detail-dialog" closedby="any" aria-labelledby="val-title">
+    <div class="dlg-head">
+      <div>
+        <div class="dlg-badges" id="val-badges"></div>
+        <h2 id="val-title">Out-of-Sample Validation &amp; Feature Ablation</h2>
+        <p class="dlg-sub" id="val-sub"></p>
+      </div>
+      <button type="button" class="dlg-close" id="val-close" aria-label="Close validation modal">&times;</button>
+    </div>
+    <div class="dlg-body">
+      <div class="dlg-section">
+        <h3>Dual Held-Out Feature Ablation (LOOCV + Chronological Walk-Forward)</h3>
+        <div class="table-wrap">
+          <table class="mini-table">
+            <thead>
+              <tr>
+                <th scope="col">Candidate Feature</th>
+                <th scope="col">LOOCV Med</th>
+                <th scope="col">LOOCV P75</th>
+                <th scope="col">Walk-Fwd Med</th>
+                <th scope="col">Decision</th>
+              </tr>
+            </thead>
+            <tbody id="val-ablation-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="dlg-section">
+        <h3>Category Residual Multipliers (Shrunk k=5, DeFi Calibration Cohort)</h3>
+        <div class="cal-chips" id="val-cat-chips"></div>
       </div>
     </div>
   </dialog>

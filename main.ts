@@ -84,7 +84,10 @@ const dossier = buildDossier(outputDir, {
 });
 writeFileSync(join(outputDir, 'dossier.json'), dossier);
 
+const v = radar.validation;
+const vc = radar.verdict_counts;
 process.stdout.write(
   `token-launch-radar: scored ${board.length} pre-token protocols (${radar.watchlist_covered}/${radar.watchlist_count} watchlist, ${radar.early_size} emerging, ${radar.live_size} tokenized peers excluded)\n` +
+    `token-launch-radar: LOOCV=${v.loocv_med_x.toFixed(2)}x (P75=${v.loocv_p75_x.toFixed(2)}x) | Walk-Fwd=${v.wf_med_x.toFixed(2)}x | Verdicts: FARM=${vc.FARM}, SELECTIVE=${vc.SELECTIVE}, SKIP=${vc.SKIP}\n` +
     `token-launch-radar: wrote board.json, data.js, ${dashFiles.length} dashboard files, ${shotFiles.length} screenshots, dossier.json (${dossier.length} bytes)\n`,
 );
