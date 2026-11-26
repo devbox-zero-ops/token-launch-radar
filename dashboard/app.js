@@ -53,13 +53,12 @@
     document.getElementById('kpi-grid').innerHTML = [
       `<div class="kpi"><div class="kpi-label">Total Pre-Token Implied Value</div><div class="kpi-val accent">${fmtUsd(data.total_implied_usd)}</div><div class="kpi-sub">${data.rows.length} protocols (${data.watchlist_covered} watchlist + ${data.early_size} emerging)</div></div>`,
       `<div class="kpi"><div class="kpi-label">#1 Ranked Protocol</div><div class="kpi-val">${esc(topRow.name)}</div><div class="kpi-sub">${fmtUsd(topRow.implied_value_usd)} [${fmtUsd(topRow.implied_low_usd)}–${fmtUsd(topRow.implied_high_usd)}]</div></div>`,
-      `<div class="kpi"><div class="kpi-label">Held-Out Accuracy (LOOCV / WF)</div><div class="kpi-val teal">${val.loocv_med_x.toFixed(2)}x / ${val.wf_med_x.toFixed(2)}x</div><div class="kpi-sub">IRLS Huber log-fit · P25–P75: ${val.p25_mult.toFixed(2)}x–${val.p75_mult.toFixed(2)}x</div></div>`,
+      `<div class="kpi"><div class="kpi-label">Held-Out Accuracy (LOOCV / WF)</div><div class="kpi-val teal">${val.loocv_med_x.toFixed(2)}x / ${val.wf_med_x.toFixed(2)}x</div><div class="kpi-sub">Peer-anchored 5-factor · P25–P75: ${val.p25_mult.toFixed(2)}x–${val.p75_mult.toFixed(2)}x</div></div>`,
       `<div class="kpi"><div class="kpi-label">$1k Farmer Verdicts</div><div class="kpi-val pos">${vc.FARM} FARM</div><div class="kpi-sub">${vc.SELECTIVE} SELECTIVE · ${vc.SKIP} SKIP (costed gas + 4% opp)</div></div>`,
     ].join('');
 
-    const catTerm = val.kept_features.includes('category_residual') ? '+γ_cat' : '';
     document.getElementById('int-summary').textContent =
-      `log(MCap)=${val.intercept.toFixed(2)}+${val.tvl_elasticity.toFixed(2)}·log(TVL)${catTerm} | Kept: ${val.kept_features.join(', ')} | Dropped: ${val.dropped_features.join(', ') || 'None'}`;
+      `Global MCap/TVL ${val.global_med_ratio.toFixed(2)}x (cohort med TVL ${fmtUsd(val.med_cohort_tvl_usd)}) · Factors: ${val.factors_used.join(' + ')}`;
 
     document.getElementById('cnt-all').textContent = String(data.rows.length);
     document.getElementById('cnt-wl').textContent = String(data.watchlist_covered);
@@ -184,15 +183,15 @@
     ].join('');
 
     document.getElementById('dlg-formula').innerHTML = [
-      `<div class="f-box"><span>TVL Base (&beta;=${b.tvl_elasticity.toFixed(2)})</span><strong>${fmtUsd(b.tvl_base_usd)}</strong></div>`,
-      `<div class="f-box"><span>Category Adj</span><strong>&times;${b.cat_multiplier.toFixed(2)}</strong></div>`,
+      `<div class="f-box"><span>${esc(b.peer_category)} Peer (n=${b.peer_sample_size})</span><strong>${b.cat_ratio.toFixed(2)}x TVL</strong></div>`,
+      `<div class="f-box"><span>Scale Dampening</span><strong>&times;${b.scale_factor.toFixed(2)}</strong></div>`,
+      `<div class="f-box"><span>7d Growth &times; Age &times; Chains</span><strong>&times;${(b.momentum_factor * b.maturity_factor * b.chain_factor).toFixed(2)}</strong></div>`,
       `<div class="f-box"><span>Effective MCap/TVL</span><strong>${b.effective_multiple.toFixed(2)}x</strong></div>`,
-      `<div class="f-box"><span>P25–P75 Band</span><strong>${b.p25_mult.toFixed(2)}x–${b.p75_mult.toFixed(2)}x</strong></div>`,
-      `<div class="f-box total"><span>Fitted P50</span><strong>${fmtUsd(r.implied_value_usd)}</strong></div>`,
+      `<div class="f-box total"><span>Implied P50</span><strong>${fmtUsd(r.implied_value_usd)}</strong></div>`,
     ].join('');
 
     document.getElementById('dlg-val-note').textContent =
-      `Token odds basis: ${r.token_odds_basis}. Dropped from valuation after failing dual held-out test: ${data.validation.dropped_features.join(', ')}.`;
+      `Token odds basis: ${r.token_odds_basis}. Factors: 7d growth ×${b.momentum_factor.toFixed(2)}, runtime age ×${b.maturity_factor.toFixed(2)}, multi-chain ×${b.chain_factor.toFixed(2)} (P25–P75 band ${b.p25_mult.toFixed(2)}x–${b.p75_mult.toFixed(2)}x).`;
 
     document.getElementById('dlg-econ').innerHTML = [
       `<div class="f-box"><span>Gross Airdrop EV</span><strong>$${e.gross_ev_usd.toFixed(2)}</strong></div>`,
@@ -219,7 +218,7 @@
 
     document.getElementById('val-ablation-body').innerHTML = v.ablation
       .map((a) => {
-        const cls = a.decision === 'KEPT' ? 'badge-farm' : a.decision === 'BASELINE' ? 'badge-em' : 'badge-skip';
+        const cls = a.decision === 'ACTIVE' ? 'badge-farm' : a.decision === 'BASELINE' ? 'badge-em' : 'badge-sel';
         return `<tr>
           <td><strong>${esc(a.feature)}</strong><div class="range-sub">${esc(a.reason)}</div></td>
           <td class="num">${a.loocv_med_x.toFixed(2)}x</td>

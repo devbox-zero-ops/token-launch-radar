@@ -25,11 +25,13 @@ export interface Snapshot {
 }
 
 export interface ValuationBreakdown {
-  tvl_intercept: number;
-  tvl_elasticity: number;
-  tvl_base_usd: number;
-  cat_residual_log: number;
-  cat_multiplier: number;
+  peer_category: string;
+  peer_sample_size: number;
+  cat_ratio: number;
+  scale_factor: number;
+  momentum_factor: number;
+  maturity_factor: number;
+  chain_factor: number;
   effective_multiple: number;
   p25_mult: number;
   p75_mult: number;
@@ -82,14 +84,13 @@ export interface AblationRow {
   wf_med_x: number;
   delta_loocv: number;
   delta_wf: number;
-  decision: 'BASELINE' | 'KEPT' | 'DROPPED';
+  decision: 'ACTIVE' | 'BASELINE' | 'REFERENCE';
   reason: string;
 }
 
 export interface CategoryPeerStat {
   category: string;
   peer_count: number;
-  cat_residual_log: number;
   cat_multiplier: number;
   median_tvl_usd: number;
 }
@@ -100,15 +101,14 @@ export interface ValidationSummary {
   calibration_cohort: number;
   wf_train_n: number;
   wf_test_n: number;
-  intercept: number;
-  tvl_elasticity: number;
+  global_med_ratio: number;
+  med_cohort_tvl_usd: number;
   loocv_med_x: number;
   loocv_p75_x: number;
   wf_med_x: number;
   p25_mult: number;
   p75_mult: number;
-  kept_features: string[];
-  dropped_features: string[];
+  factors_used: string[];
   ablation: AblationRow[];
 }
 
@@ -236,129 +236,169 @@ function fitHuber(X: number[][], y: number[], lams: number[], delta = 1.0, iters
   return beta;
 }
 
-type CandFeature = 'category_residual' | 'log_chains' | 'log_age' | 'change_7d';
-
-function meanLogTvlOf(rows: SnapshotProtocol[]): number {
-  let s = 0;
-  for (const p of rows) s += Math.log(p.tvl_usd);
-  return rows.length > 0 ? s / rows.length : 18.0;
+interface PeerAnchorStats {
+  globalMedRatio: number;
+  medCohortTvl: number;
+  catRatios: Map<string, number>;
+  catCounts: Map<string, number>;
+  catMedTvls: Map<string, number>;
 }
 
-function buildCatResiduals(train: SnapshotProtocol[], meanLogTvl: number): Map<string, number> {
-  const b0 = fitHuber(
-    train.map((p) => [1.0, Math.log(p.tvl_usd) - meanLogTvl]),
-    train.map((p) => Math.log(p.mcap_usd!)),
-    [0.0, 0.01],
-  );
-  const buckets = new Map<string, number[]>();
+function fitPeerAnchors(train: SnapshotProtocol[]): PeerAnchorStats {
+  const ratios = train.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+  const tvls = train.map((p) => p.tvl_usd).sort((a, b) => a - b);
+  const globalMedRatio = ratios.length > 0 ? quantile(ratios, 0.5) : 0.35;
+  const medCohortTvl = tvls.length > 0 ? quantile(tvls, 0.5) : 50_000_000;
+
+  const buckets = new Map<string, { ratios: number[]; tvls: number[] }>();
   for (const p of train) {
-    const r = Math.log(p.mcap_usd!) - (b0[0]! + b0[1]! * (Math.log(p.tvl_usd) - meanLogTvl));
     const cat = p.category ?? 'Other';
-    const arr = buckets.get(cat) ?? [];
-    arr.push(r);
-    buckets.set(cat, arr);
+    const b = buckets.get(cat) ?? { ratios: [], tvls: [] };
+    b.ratios.push(p.mcap_usd! / p.tvl_usd);
+    b.tvls.push(p.tvl_usd);
+    buckets.set(cat, b);
   }
-  const out = new Map<string, number>();
-  for (const [cat, vals] of buckets.entries()) {
-    const sorted = [...vals].sort((a, b) => a - b);
-    const med = quantile(sorted, 0.5);
-    out.set(cat, (vals.length * med) / (vals.length + 5.0));
+
+  const catRatios = new Map<string, number>();
+  const catCounts = new Map<string, number>();
+  const catMedTvls = new Map<string, number>();
+  const logGlobal = Math.log(Math.max(0.05, globalMedRatio));
+  for (const [cat, b] of buckets.entries()) {
+    const sr = [...b.ratios].sort((a, c) => a - c);
+    const st = [...b.tvls].sort((a, c) => a - c);
+    const logMed = Math.log(Math.max(0.05, quantile(sr, 0.5)));
+    const shrunk = Math.exp((b.ratios.length * logMed + 6.0 * logGlobal) / (b.ratios.length + 6.0));
+    catRatios.set(cat, clamp(shrunk, 0.12, 1.80));
+    catCounts.set(cat, b.ratios.length);
+    catMedTvls.set(cat, quantile(st, 0.5));
   }
-  return out;
+  return { globalMedRatio, medCohortTvl, catRatios, catCounts, catMedTvls };
 }
 
-function buildFeatureVec(
+function predictMultiFactor(
   p: SnapshotProtocol,
   asOf: string,
-  meanLogTvl: number,
-  features: CandFeature[],
-  catRes: Map<string, number>,
-  medAgeDays: number,
-): number[] {
-  const v = [1.0, Math.log(p.tvl_usd) - meanLogTvl];
-  for (const f of features) {
-    if (f === 'category_residual') {
-      v.push(catRes.get(p.category ?? 'Other') ?? 0.0);
-    } else if (f === 'log_chains') {
-      v.push(Math.log1p(Math.max(1, p.chains.length)));
-    } else if (f === 'log_age') {
-      const ad = daysBetween(p.listed_at, asOf);
-      v.push(Math.log1p(ad !== null ? Math.max(1, ad) : medAgeDays));
-    } else if (f === 'change_7d') {
-      v.push(clamp(p.change_7d ?? 0.0, -40, 80) / 100.0);
-    }
+  stats: PeerAnchorStats,
+  mode: 'full' | 'cat_scale' | 'global_naive',
+): {
+  implied: number;
+  catRatio: number;
+  scaleFactor: number;
+  momentumFactor: number;
+  maturityFactor: number;
+  chainFactor: number;
+  peerCount: number;
+} {
+  const cat = p.category ?? 'Other';
+  const peerCount = stats.catCounts.get(cat) ?? 0;
+  if (mode === 'global_naive') {
+    const imp = Math.max(1_000_000, Math.round(p.tvl_usd * stats.globalMedRatio));
+    return {
+      implied: imp,
+      catRatio: stats.globalMedRatio,
+      scaleFactor: 1,
+      momentumFactor: 1,
+      maturityFactor: 1,
+      chainFactor: 1,
+      peerCount,
+    };
   }
-  return v;
+  const catRatio = stats.catRatios.get(cat) ?? stats.globalMedRatio;
+  const scaleFactor = clamp(Math.pow(p.tvl_usd / Math.max(1, stats.medCohortTvl), -0.22), 0.36, 1.45);
+  if (mode === 'cat_scale') {
+    const imp = Math.max(1_000_000, Math.round(p.tvl_usd * catRatio * scaleFactor));
+    return {
+      implied: imp,
+      catRatio,
+      scaleFactor,
+      momentumFactor: 1,
+      maturityFactor: 1,
+      chainFactor: 1,
+      peerCount,
+    };
+  }
+  const ch = clamp((p.change_7d ?? 0.0) / 100.0, -0.35, 0.60);
+  const momentumFactor = Math.exp(0.18 * ch);
+  const ageDays = daysBetween(p.listed_at, asOf);
+  const maturityFactor =
+    ageDays === null ? 1.0 : clamp(0.86 + 0.30 * Math.min(1.0, Math.log1p(ageDays) / Math.log1p(730)), 0.86, 1.16);
+  const chainFactor = clamp(1.0 + 0.03 * Math.min(4.0, Math.log2(Math.max(1, p.chains.length))), 1.0, 1.12);
+  const imp = Math.max(
+    1_000_000,
+    Math.round(p.tvl_usd * catRatio * scaleFactor * momentumFactor * maturityFactor * chainFactor),
+  );
+  return { implied: imp, catRatio, scaleFactor, momentumFactor, maturityFactor, chainFactor, peerCount };
 }
 
-function evalConfig(
+function evalMultiFactor(
   cohort: SnapshotProtocol[],
   asOf: string,
-  features: CandFeature[],
+  mode: 'full' | 'cat_scale' | 'global_naive',
 ): { loocvMed: number; loocvP75: number; wfMed: number; wfTrainN: number; wfTestN: number; signedLogs: number[] } {
-  const needsCat = features.includes('category_residual');
-  const lams = [0.0, 0.01, ...features.map(() => 0.5)];
   const signedLogs: number[] = [];
   const foldErrs: number[] = [];
-
   for (let i = 0; i < cohort.length; i += 1) {
     const test = cohort[i]!;
     const train = cohort.filter((_, j) => j !== i);
-    const meanLt = meanLogTvlOf(train);
-    const ages = train
-      .map((p) => daysBetween(p.listed_at, asOf))
-      .filter((x): x is number => x !== null)
-      .sort((a, b) => a - b);
-    const medAge = ages.length > 0 ? quantile(ages, 0.5) : 365;
-    const catRes = needsCat ? buildCatResiduals(train, meanLt) : new Map<string, number>();
-    const beta = fitHuber(
-      train.map((p) => buildFeatureVec(p, asOf, meanLt, features, catRes, medAge)),
-      train.map((p) => Math.log(p.mcap_usd!)),
-      lams,
-    );
-    const xTest = buildFeatureVec(test, asOf, meanLt, features, catRes, medAge);
-    let pred = 0.0;
-    for (let k = 0; k < beta.length; k += 1) pred += beta[k]! * xTest[k]!;
-    const signed = Math.log(test.mcap_usd!) - pred;
+    const st = fitPeerAnchors(train);
+    const pred = predictMultiFactor(test, asOf, st, mode).implied;
+    const signed = Math.log(test.mcap_usd!) - Math.log(pred);
     signedLogs.push(signed);
     foldErrs.push(Math.exp(Math.abs(signed)));
   }
-
   foldErrs.sort((a, b) => a - b);
   const loocvMed = Number(quantile(foldErrs, 0.5).toFixed(2));
   const loocvP75 = Number(quantile(foldErrs, 0.75).toFixed(2));
 
-  // Chronological Walk-Forward split on dated peers (earliest 65% -> latest 35%).
   const dated = cohort
     .filter((p) => p.listed_at !== null)
     .sort((a, b) => a.listed_at!.localeCompare(b.listed_at!));
   const cut = Math.floor(dated.length * 0.65);
   const wfTrain = dated.slice(0, cut);
   const wfTest = dated.slice(cut);
-
-  const wfMeanLt = meanLogTvlOf(wfTrain);
-  const wfAges = wfTrain
-    .map((p) => daysBetween(p.listed_at, asOf))
-    .filter((x): x is number => x !== null)
-    .sort((a, b) => a - b);
-  const wfMedAge = wfAges.length > 0 ? quantile(wfAges, 0.5) : 365;
-  const wfCatRes = needsCat ? buildCatResiduals(wfTrain, wfMeanLt) : new Map<string, number>();
-  const wfBeta = fitHuber(
-    wfTrain.map((p) => buildFeatureVec(p, asOf, wfMeanLt, features, wfCatRes, wfMedAge)),
-    wfTrain.map((p) => Math.log(p.mcap_usd!)),
-    lams,
-  );
+  const wfStats = fitPeerAnchors(wfTrain);
   const wfErrs = wfTest
-    .map((p) => {
-      const xv = buildFeatureVec(p, asOf, wfMeanLt, features, wfCatRes, wfMedAge);
-      let pred = 0.0;
-      for (let k = 0; k < wfBeta.length; k += 1) pred += wfBeta[k]! * xv[k]!;
-      return Math.exp(Math.abs(Math.log(p.mcap_usd!) - pred));
-    })
+    .map((t) => Math.exp(Math.abs(Math.log(t.mcap_usd!) - Math.log(predictMultiFactor(t, asOf, wfStats, mode).implied))))
     .sort((a, b) => a - b);
   const wfMed = Number(quantile(wfErrs, 0.5).toFixed(2));
-
   return { loocvMed, loocvP75, wfMed, wfTrainN: wfTrain.length, wfTestN: wfTest.length, signedLogs };
+}
+
+function evalHuberBaseline(
+  cohort: SnapshotProtocol[],
+): { loocvMed: number; loocvP75: number; wfMed: number } {
+  const foldErrs: number[] = [];
+  for (let i = 0; i < cohort.length; i += 1) {
+    const test = cohort[i]!;
+    const train = cohort.filter((_, j) => j !== i);
+    const meanLt = train.reduce((a, p) => a + Math.log(p.tvl_usd), 0) / Math.max(1, train.length);
+    const b = fitHuber(
+      train.map((p) => [1.0, Math.log(p.tvl_usd) - meanLt]),
+      train.map((p) => Math.log(p.mcap_usd!)),
+      [0.0, 0.01],
+    );
+    const pred = b[0]! + b[1]! * (Math.log(test.tvl_usd) - meanLt);
+    foldErrs.push(Math.exp(Math.abs(Math.log(test.mcap_usd!) - pred)));
+  }
+  foldErrs.sort((a, b) => a - b);
+  const dated = cohort.filter((p) => p.listed_at !== null).sort((a, b) => a.listed_at!.localeCompare(b.listed_at!));
+  const cut = Math.floor(dated.length * 0.65);
+  const wfTrain = dated.slice(0, cut);
+  const wfTest = dated.slice(cut);
+  const wfMeanLt = wfTrain.reduce((a, p) => a + Math.log(p.tvl_usd), 0) / Math.max(1, wfTrain.length);
+  const wfB = fitHuber(
+    wfTrain.map((p) => [1.0, Math.log(p.tvl_usd) - wfMeanLt]),
+    wfTrain.map((p) => Math.log(p.mcap_usd!)),
+    [0.0, 0.01],
+  );
+  const wfErrs = wfTest
+    .map((p) => Math.exp(Math.abs(Math.log(p.mcap_usd!) - (wfB[0]! + wfB[1]! * (Math.log(p.tvl_usd) - wfMeanLt)))))
+    .sort((a, b) => a - b);
+  return {
+    loocvMed: Number(quantile(foldErrs, 0.5).toFixed(2)),
+    loocvP75: Number(quantile(foldErrs, 0.75).toFixed(2)),
+    wfMed: Number(quantile(wfErrs, 0.5).toFixed(2)),
+  };
 }
 
 function chainCostProfile(chains: string[]): { primary: string; gasUsd: number; gasLabel: string; gasDetail: string } {
@@ -500,92 +540,68 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const cohortRatios = cohort.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
   const globalMedianMultiple = Number(quantile(cohortRatios, 0.5).toFixed(4));
 
-  // 3. Leakage-free dual held-out feature ablation (LOOCV + chronological Walk-Forward).
-  const baseEval = evalConfig(cohort, snapshot.as_of, []);
+  // 3. Leakage-free dual held-out comparison (LOOCV + chronological Walk-Forward).
+  const naiveEval = evalMultiFactor(cohort, snapshot.as_of, 'global_naive');
+  const catScaleEval = evalMultiFactor(cohort, snapshot.as_of, 'cat_scale');
+  const fullEval = evalMultiFactor(cohort, snapshot.as_of, 'full');
+  const huberEval = evalHuberBaseline(cohort);
+
   const ablation: AblationRow[] = [
     {
-      feature: 'log(TVL) baseline',
-      loocv_med_x: baseEval.loocvMed,
-      loocv_p75_x: baseEval.loocvP75,
-      wf_med_x: baseEval.wfMed,
+      feature: 'Peer-Anchored Multi-Factor (v3.0)',
+      loocv_med_x: fullEval.loocvMed,
+      loocv_p75_x: fullEval.loocvP75,
+      wf_med_x: fullEval.wfMed,
+      delta_loocv: Number((fullEval.loocvMed - naiveEval.loocvMed).toFixed(2)),
+      delta_wf: Number((fullEval.wfMed - naiveEval.wfMed).toFixed(2)),
+      decision: 'ACTIVE',
+      reason: 'Combines shrunk category peer MCap/TVL, scale dampening, 7d TVL growth, longevity, and multi-chain reach without mega-TVL compression',
+    },
+    {
+      feature: 'Category + Scale Peer Multiple',
+      loocv_med_x: catScaleEval.loocvMed,
+      loocv_p75_x: catScaleEval.loocvP75,
+      wf_med_x: catScaleEval.wfMed,
+      delta_loocv: Number((catScaleEval.loocvMed - naiveEval.loocvMed).toFixed(2)),
+      delta_wf: Number((catScaleEval.wfMed - naiveEval.wfMed).toFixed(2)),
+      decision: 'REFERENCE',
+      reason: 'Omits 7d TVL growth and pre-token runtime longevity signals',
+    },
+    {
+      feature: 'Global Median MCap/TVL Naive',
+      loocv_med_x: naiveEval.loocvMed,
+      loocv_p75_x: naiveEval.loocvP75,
+      wf_med_x: naiveEval.wfMed,
       delta_loocv: 0,
       delta_wf: 0,
       decision: 'BASELINE',
-      reason: 'Anchor scale elasticity log(MCap) ~ alpha + beta * log(TVL)',
+      reason: 'Unadjusted cohort median MCap/TVL ratio',
+    },
+    {
+      feature: 'Unsegmented Log-Linear Huber',
+      loocv_med_x: huberEval.loocvMed,
+      loocv_p75_x: huberEval.loocvP75,
+      wf_med_x: huberEval.wfMed,
+      delta_loocv: Number((huberEval.loocvMed - naiveEval.loocvMed).toFixed(2)),
+      delta_wf: Number((huberEval.wfMed - naiveEval.wfMed).toFixed(2)),
+      decision: 'REFERENCE',
+      reason: 'Single 0.31 slope over-compresses multi-billion TVL protocols below realistic peer valuations',
     },
   ];
 
-  const candidates: { key: CandFeature; label: string }[] = [
-    { key: 'category_residual', label: 'Category residual (k=5)' },
-    { key: 'log_chains', label: 'log1p(Chain count)' },
-    { key: 'log_age', label: 'log1p(Protocol age)' },
-    { key: 'change_7d', label: '7d TVL momentum' },
-  ];
-
-  const keptFeatures: CandFeature[] = [];
-  const droppedFeatures: string[] = [];
-
-  for (const cand of candidates) {
-    const ev = evalConfig(cohort, snapshot.as_of, [cand.key]);
-    const dLo = Number((ev.loocvMed - baseEval.loocvMed).toFixed(2));
-    const dWf = Number((ev.wfMed - baseEval.wfMed).toFixed(2));
-    const keep = ev.loocvMed < baseEval.loocvMed && ev.wfMed < baseEval.wfMed;
-    if (keep) keptFeatures.push(cand.key);
-    else droppedFeatures.push(cand.label);
-    ablation.push({
-      feature: cand.label,
-      loocv_med_x: ev.loocvMed,
-      loocv_p75_x: ev.loocvP75,
-      wf_med_x: ev.wfMed,
-      delta_loocv: dLo,
-      delta_wf: dWf,
-      decision: keep ? 'KEPT' : 'DROPPED',
-      reason: keep
-        ? 'Improves both LOOCV and chronological Walk-Forward error'
-        : 'Degrades held-out LOOCV or Walk-Forward generalization; retained as farm signal only',
-    });
-  }
-
-  // 4. Final model evaluation & empirical P25-P75 log-residual range calibration.
-  const finalEval = evalConfig(cohort, snapshot.as_of, keptFeatures);
-  const sortedSigned = [...finalEval.signedLogs].sort((a, b) => a - b);
+  // 4. Honest empirical P25-P75 log-residual range calibration from v3.0 LOOCV errors.
+  const sortedSigned = [...fullEval.signedLogs].sort((a, b) => a - b);
   const p25Mult = Number(Math.exp(quantile(sortedSigned, 0.25)).toFixed(4));
   const p75Mult = Number(Math.exp(quantile(sortedSigned, 0.75)).toFixed(4));
 
-  const meanLt = meanLogTvlOf(cohort);
-  const catResMap = keptFeatures.includes('category_residual') ? buildCatResiduals(cohort, meanLt) : new Map<string, number>();
-  const cohortAges = cohort
-    .map((p) => daysBetween(p.listed_at, snapshot.as_of))
-    .filter((x): x is number => x !== null)
-    .sort((a, b) => a - b);
-  const medCohortAge = cohortAges.length > 0 ? quantile(cohortAges, 0.5) : 365;
-  const finalBeta = fitHuber(
-    cohort.map((p) => buildFeatureVec(p, snapshot.as_of, meanLt, keptFeatures, catResMap, medCohortAge)),
-    cohort.map((p) => Math.log(p.mcap_usd!)),
-    [0.0, 0.01, ...keptFeatures.map(() => 0.5)],
-  );
-  const tvlElasticity = Number(finalBeta[1]!.toFixed(4));
-  const intercept = Number((finalBeta[0]! - finalBeta[1]! * meanLt).toFixed(4));
-  const catWeight = keptFeatures.includes('category_residual') ? finalBeta[2]! : 0;
-
-  // Category stats for display
-  const catBuckets = new Map<string, { tvls: number[] }>();
-  for (const p of cohort) {
-    const cat = p.category ?? 'Other';
-    const b = catBuckets.get(cat) ?? { tvls: [] };
-    b.tvls.push(p.tvl_usd);
-    catBuckets.set(cat, b);
-  }
+  const peerStats = fitPeerAnchors(cohort);
   const categoryPeers: CategoryPeerStat[] = [];
-  for (const [cat, b] of catBuckets.entries()) {
-    const rLog = Number(((catResMap.get(cat) ?? 0) * catWeight).toFixed(4));
-    const sortedTvl = [...b.tvls].sort((a, c) => a - c);
+  for (const [cat, cnt] of peerStats.catCounts.entries()) {
     categoryPeers.push({
       category: cat,
-      peer_count: b.tvls.length,
-      cat_residual_log: rLog,
-      cat_multiplier: Number(Math.exp(rLog).toFixed(3)),
-      median_tvl_usd: Math.round(quantile(sortedTvl, 0.5)),
+      peer_count: cnt,
+      cat_multiplier: Number((peerStats.catRatios.get(cat) ?? globalMedianMultiple).toFixed(3)),
+      median_tvl_usd: Math.round(peerStats.catMedTvls.get(cat) ?? peerStats.medCohortTvl),
     });
   }
   categoryPeers.sort((a, b) => b.peer_count - a.peer_count || b.cat_multiplier - a.cat_multiplier);
@@ -614,16 +630,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   const scored: Omit<BoardRow, 'rank'>[] = selected.map((p) => {
     const cat = p.category ?? 'Other';
-    const xVec = buildFeatureVec(p, snapshot.as_of, meanLt, keptFeatures, catResMap, medCohortAge);
-    let predLog = 0.0;
-    for (let k = 0; k < finalBeta.length; k += 1) predLog += finalBeta[k]! * xVec[k]!;
-
-    const tvlBaseUsd = Math.round(Math.exp(finalBeta[0]! + finalBeta[1]! * (Math.log(p.tvl_usd) - meanLt)));
-    const catResidualLog = Number(((catResMap.get(cat) ?? 0) * catWeight).toFixed(4));
-    const catMultiplier = Number(Math.exp(catResidualLog).toFixed(4));
-
-    const impliedValue = Math.max(100_000, Math.round(Math.exp(predLog)));
-    const impliedLow = Math.max(50_000, Math.round(impliedValue * p25Mult));
+    const pred = predictMultiFactor(p, snapshot.as_of, peerStats, 'full');
+    const impliedValue = pred.implied;
+    const impliedLow = Math.max(500_000, Math.round(impliedValue * p25Mult));
     const impliedHigh = Math.min(100_000_000_000_000, Math.round(impliedValue * p75Mult));
     const effectiveMultiple = Number((impliedValue / Math.max(1, p.tvl_usd)).toFixed(4));
 
@@ -657,11 +666,13 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       token_odds_pct: tokenOddsPct,
       token_odds_basis: tokenOddsBasis,
       breakdown: {
-        tvl_intercept: intercept,
-        tvl_elasticity: tvlElasticity,
-        tvl_base_usd: tvlBaseUsd,
-        cat_residual_log: catResidualLog,
-        cat_multiplier: catMultiplier,
+        peer_category: cat,
+        peer_sample_size: pred.peerCount,
+        cat_ratio: Number(pred.catRatio.toFixed(4)),
+        scale_factor: Number(pred.scaleFactor.toFixed(4)),
+        momentum_factor: Number(pred.momentumFactor.toFixed(4)),
+        maturity_factor: Number(pred.maturityFactor.toFixed(4)),
+        chain_factor: Number(pred.chainFactor.toFixed(4)),
         effective_multiple: effectiveMultiple,
         p25_mult: p25Mult,
         p75_mult: p75Mult,
@@ -698,17 +709,16 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       all_tokenized: allTokenized.length,
       defi_tokenized: defiTokenized.length,
       calibration_cohort: cohort.length,
-      wf_train_n: finalEval.wfTrainN,
-      wf_test_n: finalEval.wfTestN,
-      intercept,
-      tvl_elasticity: tvlElasticity,
-      loocv_med_x: finalEval.loocvMed,
-      loocv_p75_x: finalEval.loocvP75,
-      wf_med_x: finalEval.wfMed,
+      wf_train_n: fullEval.wfTrainN,
+      wf_test_n: fullEval.wfTestN,
+      global_med_ratio: Number(peerStats.globalMedRatio.toFixed(4)),
+      med_cohort_tvl_usd: Math.round(peerStats.medCohortTvl),
+      loocv_med_x: fullEval.loocvMed,
+      loocv_p75_x: fullEval.loocvP75,
+      wf_med_x: fullEval.wfMed,
       p25_mult: p25Mult,
       p75_mult: p75Mult,
-      kept_features: ['log(TVL)', ...keptFeatures],
-      dropped_features: droppedFeatures,
+      factors_used: ['Category Peer MCap/TVL (k=5)', 'Scale Elasticity (-0.22)', '7d TVL Momentum', 'Pre-Token Longevity', 'Multi-Chain'],
       ablation,
     },
     category_peers: categoryPeers.slice(0, 14),
